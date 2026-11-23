@@ -243,7 +243,7 @@ prune_diff() {
 
   local sign="$1"
 
-  eval git diff "$diff_args" | grep "^$sign"  | grep -E '[[:alnum:]]' | grep -vE "^\\$sign\\$sign\\$sign"
+  git diff "${diff_args[@]}" | grep "^$sign"  | grep -E '[[:alnum:]]' | grep -vE "^\\$sign\\$sign\\$sign"
 }
 
 
@@ -300,7 +300,7 @@ store_diff_list() {
 
 # -------------------------------------------------------------------------
 #
-# Write in EXCLUDE_LIST the command line arguments that have to be passed
+# Write in EXCLUDE_ARGS the command line arguments that have to be passed
 # to the diff command to ignore:
 #   - the output directories of:
 #      - tests whose inputs have been modified
@@ -315,7 +315,7 @@ store_diff_list() {
 # containing test paths.
 #
 # Modifies global variable:
-#   EXCLUDE_LIST: concatenation of the diff exclusion commands
+#   EXCLUDE_ARGS: array of diff exclusion arguments
 #
 # Example:
 #   exclude_from_diff "./dir1/dir2/ dir3/dir4" 0
@@ -341,14 +341,26 @@ exclude_from_diff() {
     # Find the main.xml file in the given path and extract the run names
     if [ -d "$filepath" ]
     then
+      # Anchor relative paths so find never reads a test path as an option
+      local search_path="$filepath"
+      case "$search_path" in
+        /*) ;;
+        *) search_path="./$search_path" ;;
+      esac
       while IFS= read -r run_name
       do
-        EXCLUDE_LIST+=" -x $run_name"
+        if [[ ! "$run_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          printf '%s\n' 'Invalid run name in non-regression test list.' >&2
+          return 1
+        fi
+        EXCLUDE_ARGS+=(-x "$run_name")
         if [ "$2" -eq "1" ]
         then
-          EXCLUDE_LIST+=" --ignore-matching-lines=$filepath"
+          local literal_filepath
+          literal_filepath=$(printf '%s' "$filepath" | sed 's/[][\\^$.*/]/\\&/g')
+          EXCLUDE_ARGS+=("--ignore-matching-lines=$literal_filepath")
         fi
-      done < <(find "$filepath" -type f -name "main.xml" -exec sed -n 's:.*<run>\(.*\)</run>.*:\1:p' {} +)
+      done < <(find "$search_path" -type f -name "main.xml" -exec sed -n 's:.*<run>\(.*\)</run>.*:\1:p' {} +)
     fi
   done <<< "$1"
 }
@@ -364,7 +376,7 @@ exclude_from_diff() {
 #   INPUT_DIFFS: list of non regression test cases with modified inputs
 #   ADDED_LIST: list of non regression tests added in <test_list>
 #   REMOVED_LIST: list of non regression tests deleted from <test_list>
-#   EXCLUDE_LIST: computed diff exclusion arguments
+#   EXCLUDE_ARGS: computed diff exclusion arguments
 #
 # Returns:
 #    0 for success (no diff, news tests added to the test list or modification
@@ -421,7 +433,8 @@ eval_diff() {
   #exclude_from_diff "$INPUT_DIFFS" 0
 
   # Second: check for added/removed test cases in the non regression test list
-  local diff_args="--ignore-blank-lines --ignore-space-change $reference_branch..$validation_branch -- $test_list"
+  local -a diff_args=(--ignore-blank-lines --ignore-space-change "$reference_branch..$validation_branch" -- "$test_list")
+  EXCLUDE_ARGS=()
 
   # The 'git diff --numstat' command allow to find easily stat infos
   # on number of lines changed between commits but it counts blank
@@ -434,7 +447,7 @@ eval_diff() {
   # --numstat', then we treat non empty diffs with combinations of
   # diff and grep commands.
   local has_diff
-  has_diff=$(eval git diff --numstat "$diff_args" | wc -l)
+  has_diff=$(git diff --numstat "${diff_args[@]}" | wc -l)
 
   if [[ "$has_diff" -eq "0" ]]
   then
@@ -444,7 +457,7 @@ eval_diff() {
   then
     echo "Warning: $test_list file contains modifications."
 
-    diff_args="-U0 $diff_args"
+    diff_args=(-U0 "${diff_args[@]}")
 
     local added
     added="$(count_line_diffs '+')"
@@ -452,7 +465,7 @@ eval_diff() {
     then
       echo "         Added   $added line(s) of test case(s)."
       ADDED_LIST="$(store_diff_list '+')"
-      exclude_from_diff "$ADDED_LIST" 1
+      exclude_from_diff "$ADDED_LIST" 1 || return 1
 
     fi
 
@@ -463,7 +476,7 @@ eval_diff() {
       echo "         Removed $removed line(s) of test case(s)."
       echo "         => pipeline marked as failed!"
       REMOVED_LIST="$(store_diff_list '-')"
-      exclude_from_diff "$REMOVED_LIST" 1
+      exclude_from_diff "$REMOVED_LIST" 1 || return 1
       err=1
     fi
 
@@ -525,7 +538,7 @@ function cleanup {
 # Uses global variables:
 #   TEST_OUTPUTS - output filename for `run.sh` script (terminal test outputs)
 #   REPORT_DIR - name of folder for report storage
-#   EXCLUDE_LIST - diff exclusion arguments
+#   EXCLUDE_ARGS - diff exclusion arguments
 #
 # Deletes:
 #   nonreg/results_reference - reference results from a previous non regression run
@@ -556,19 +569,25 @@ check_and_clean() {
   echo "-----------------------------------------"
   echo "Computing differences between reference and validation branches..."
 
-  echo "Exclude list: $EXCLUDE_LIST"
-
-  cmd="diff --ignore-blank-lines --ignore-space-change "$EXCLUDE_LIST" -x "$TEST_OUTPUTS" -qr -x 'infoCalcul.out' -x '.DS_Store' "$REPORT_DIR"/results_reference "$REPORT_DIR"/results_validation > $REPORT_DIR/diff_nonreg.out 2>&1 || true"
-
-  # Here the run_cmd script fails for normal mode due to the combination of output redirection and
-  # protected arguments passed to 'eval' ('\$*')
+  local -a cmd=(diff --ignore-blank-lines --ignore-space-change
+                "${EXCLUDE_ARGS[@]}" -x "$TEST_OUTPUTS" -qr
+                -x 'infoCalcul.out' -x '.DS_Store' --
+                "$REPORT_DIR/results_reference" "$REPORT_DIR/results_validation")
   if [ "$DRY_RUN" = "true" ]; then
-    echo "dry-run: $cmd"
-  else
-    eval "$cmd"
+    printf 'dry-run:'
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    return 0
   fi
 
-  if [ -s "$REPORT_DIR"/diff_nonreg.out ]
+  local diff_status=0
+  "${cmd[@]}" > "$REPORT_DIR/diff_nonreg.out" 2>&1 || diff_status=$?
+  if [ "$diff_status" -gt 1 ]; then
+    echo "Could not compare results; inspect $REPORT_DIR/diff_nonreg.out."
+    return 1
+  fi
+
+  if [ "$diff_status" -eq 1 ]
   then
     echo "Differences exist: details available in $REPORT_DIR/diff_nonreg.out file."
     printf '\n%s\n' "-- Step status: Failed"
@@ -589,9 +608,7 @@ run_cmd() {
   if [ "$DRY_RUN" = "true" ]; then
     echo "dry-run: $*"
   else
-    # $* is escaped to avoid special char evaluation before command execution which may lead to missing argument
-    # when the name of evaluation branch starts by # for example (# is evaluated as a comment). See PR #119.
-    eval "\$*"
+    "$@"
   fi
 }
 
