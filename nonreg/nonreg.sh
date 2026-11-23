@@ -341,6 +341,12 @@ exclude_from_diff() {
     # Find the main.xml file in the given path and extract the run names
     if [ -d "$filepath" ]
     then
+      # Anchor relative paths so find never reads a test path as an option
+      local search_path="$filepath"
+      case "$search_path" in
+        /*) ;;
+        *) search_path="./$search_path" ;;
+      esac
       while IFS= read -r run_name
       do
         if [[ ! "$run_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -354,7 +360,7 @@ exclude_from_diff() {
           literal_filepath=$(printf '%s' "$filepath" | sed 's/[][\\^$.*/]/\\&/g')
           EXCLUDE_ARGS+=("--ignore-matching-lines=$literal_filepath")
         fi
-      done < <(find "$filepath" -type f -name "main.xml" -exec sed -n 's:.*<run>\(.*\)</run>.*:\1:p' {} +)
+      done < <(find "$search_path" -type f -name "main.xml" -exec sed -n 's:.*<run>\(.*\)</run>.*:\1:p' {} +)
     fi
   done <<< "$1"
 }
